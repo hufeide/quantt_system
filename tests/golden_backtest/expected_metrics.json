@@ -1,0 +1,13 @@
+{
+  "fingerprint": "00ecfffca91f4d09e48af18caa3463ad864cf49fbf2fb185d0757f486baeedff",
+  "trade_count": 341,
+  "round_trips": 272,
+  "final_equity": 1117054.304603,
+  "total_return": 0.1170543,
+  "max_drawdown": 0.01694728,
+  "sharpe": 24.376403,
+  "total_fees": 22240.503097,
+  "realized_pnl": 111820.914956,
+  "turnover": 38.084275,
+  "trades_digest": "7e8a4b0ac59d5c93c9188a7b789cc324c5451f2f3c5e6538e0254e19ba163768"
+}

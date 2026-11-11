@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# FastAPI 服务镜像
+#   docker build -f infrastructure/docker/Dockerfile.api -t quant-replay-api:1.0.0 .
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 共享基础层（base）
+#
+# 三个镜像（api / worker / web）都从同一个 base stage 出发：相同的 apt 包、
+# 相同的 Python 依赖、相同的非 root 用户、相同的 tini 作为 PID 1。
+# 因为这段内容在三个 Dockerfile 中逐字一致，Docker 的层缓存和 registry 中的
+# blob 会在三个镜像之间复用，不会重复占用磁盘。
+#
+# 构建上下文必须是仓库根目录：
+#   docker build -f infrastructure/docker/Dockerfile.api -t quant-replay-api:1.0.0 .
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/opt/quant \
+    TZ=Asia/Shanghai \
+    QUANT_HOME=/opt/quant \
+    QUANT_DATA_ROOT=/data
+
+# curl: 健康检查用；tini: 正确转发 SIGTERM，Celery / uvicorn 才能优雅退出
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl tini \
+ && rm -rf /var/lib/apt/lists/*
+
+# 非 root 用户，uid/gid 固定，K8s securityContext 里用 runAsUser: 10001 对应
+RUN groupadd --gid 10001 quant \
+ && useradd --uid 10001 --gid quant --create-home --shell /usr/sbin/nologin quant \
+ && mkdir -p /data /opt/quant \
+ && chown -R quant:quant /data /opt/quant
+
+WORKDIR /opt/quant
+
+# 依赖层单独缓存：只有 pyproject.toml 里的 dependencies 变化才会重新安装。
+# 直接从 pyproject.toml 读出依赖列表，避免为了缓存而提前复制源码。
+COPY pyproject.toml ./
+RUN python -c "import pathlib, tomllib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print('\n'.join(d['project']['dependencies']))" > /tmp/requirements.txt \
+ && pip install --no-cache-dir -r /tmp/requirements.txt \
+ && rm -f /tmp/requirements.txt
+
+# 代码里的默认相对路径是 data_files / data_files/backtests，
+# 容器里统一挂载到 /data，用符号链接让两套写法指向同一个目录。
+RUN ln -s /data /opt/quant/data_files
+
+# 应用源码（.dockerignore 已排除 .venv / data_files / .git / tests 等）
+COPY --chown=10001:10001 . .
+RUN pip install --no-cache-dir --no-deps .
+
+USER 10001:10001
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+EXPOSE 8000
+
+# 镜像内自带健康检查；K8s 里另用 /health 做 liveness/readiness
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+
+# --proxy-headers: 信任 Nginx Ingress 传来的 X-Forwarded-*，日志里才是真实客户端 IP
+CMD ["uvicorn", "apps.api.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--forwarded-allow-ips", "*", \
+     "--workers", "1"]

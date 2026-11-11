@@ -1,0 +1,30 @@
+# Grafana 数据源（provisioning）
+# 由 scripts/deploy.sh 生成为 ConfigMap grafana-datasources，挂到
+# /etc/grafana/provisioning/datasources/datasources.yaml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    orgId: 1
+    url: http://prometheus.quant-monitor.svc.cluster.local:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST
+      # 回测的模拟时间跨度可能很大，限制最大点数避免浏览器卡死
+      maxDataPoints: 2000
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    orgId: 1
+    url: http://loki.quant-monitor.svc.cluster.local:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      timeout: 60

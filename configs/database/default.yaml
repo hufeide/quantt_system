@@ -1,0 +1,29 @@
+# 数据库连接配置（本地开发默认值）
+mongodb:
+  uri: "mongodb://localhost:27017"
+  database: "quant_replay"
+  collections:
+    strategies: "strategies"
+    backtests: "backtests"
+    tasks: "tasks"
+    accounts: "accounts"
+
+rabbitmq:
+  broker_url: "amqp://guest:guest@localhost:5672//"
+  result_backend: "rpc://"
+  queues:
+    - replay
+    - backtest
+    - factor
+    - optimization
+    - maintenance
+
+duckdb:
+  path: "data_files/analytics.duckdb"
+  read_only: false
+
+paths:
+  raw: "data_files/raw"
+  normalized: "data_files/normalized"
+  factors: "data_files/factors"
+  backtests: "data_files/backtests"

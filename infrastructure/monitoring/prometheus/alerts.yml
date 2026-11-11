@@ -1,0 +1,164 @@
+groups:
+  - name: quant-backtest
+    rules:
+      - alert: BacktestFailureRateHigh
+        expr: |
+          sum(rate(quant_backtest_runs_total{status="failed"}[10m]))
+            / clamp_min(sum(rate(quant_backtest_runs_total{status=~"success|failed"}[10m])), 0.001) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "回测失败率超过 20%"
+          description: "最近 10 分钟回测失败率 {{ $value | humanizePercentage }}，检查 worker 日志中的 exception 字段。"
+
+      - alert: BacktestQueueBacklog
+        expr: sum(quant_backtest_queue_depth{queue="backtest"}) > 20
+        for: 15m
+        labels:
+          severity: warning
+          component: mq
+        annotations:
+          summary: "回测队列积压 {{ $value }} 个任务"
+          description: "队列持续积压 15 分钟以上，可能需要扩容 worker 或降低并发。"
+
+      - alert: BacktestQueueStalled
+        expr: |
+          sum(rate(quant_bars_processed_total[5m])) == 0
+            and sum(quant_backtest_queue_depth{queue="backtest"}) > 0
+        for: 10m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "队列有任务但没有 Bar 被处理"
+          description: "worker 可能卡死或与 broker 断连，检查 celery inspect active。"
+
+      - alert: BacktestDurationP95High
+        expr: histogram_quantile(0.95, sum(rate(quant_backtest_duration_seconds_bucket[30m])) by (le)) > 1800
+        for: 30m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "回测 P95 耗时超过 30 分钟"
+          description: "回测明显变慢，检查是否发生内存换页或数据集过大。"
+
+  - name: quant-data
+    rules:
+      - alert: DataLagHigh
+        expr: max(quant_data_lag_seconds) > 86400
+        for: 30m
+        labels:
+          severity: warning
+          component: data
+        annotations:
+          summary: "行情数据延迟 {{ $value | humanizeDuration }}"
+          description: "最新可用 Bar 与当前时间差距过大，检查数据接入任务。"
+
+      - alert: DataMissingMinutesHigh
+        expr: max(quant_data_missing_minutes) > 5
+        for: 15m
+        labels:
+          severity: warning
+          component: data
+        annotations:
+          summary: "交易日缺失分钟数 {{ $value }}"
+          description: "数据校验发现缺失 Bar，可能影响回测结果的可信度。"
+
+      - alert: DataDuplicateBars
+        expr: max(quant_data_duplicate_bars) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: data
+        annotations:
+          summary: "检测到重复 Bar"
+          description: "同一 symbol+时间戳出现多条记录，请检查标准化流程的去重逻辑。"
+
+  - name: quant-platform
+    rules:
+      - alert: ApiDown
+        expr: up{job="kubernetes-pods",app="api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "FastAPI 无法抓取指标"
+          description: "{{ $labels.pod }} 上的 /metrics 不可达，检查 Pod 是否 CrashLoopBackOff。"
+
+      - alert: WorkerNotReady
+        expr: kube_deployment_status_replicas_available{deployment="backtest-worker"} < 1
+        for: 5m
+        labels:
+          severity: critical
+          component: worker
+        annotations:
+          summary: "没有可用的回测 worker"
+          description: "backtest-worker 可用副本为 0，任务不会被执行。"
+
+      - alert: PodRestartLoop
+        expr: increase(kube_pod_container_status_restarts_total{namespace=~"quant-.*"}[30m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          component: platform
+        annotations:
+          summary: "Pod {{ $labels.pod }} 反复重启"
+          description: "30 分钟内重启 {{ $value }} 次，检查探针配置与 OOMKilled。"
+
+      - alert: DiskSpaceLow
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} 
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 0.15
+        for: 15m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "根分区剩余空间不足 15%"
+          description: "回测产物和 Parquet 文件会持续增长，请清理或扩容。"
+
+      - alert: DiskSpaceCritical
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: host
+        annotations:
+          summary: "根分区剩余空间不足 5%"
+          description: "MongoDB 与 K3s 都可能因磁盘写满而故障，立即处理。"
+
+      - alert: MemoryPressureHigh
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: "主机内存使用率超过 90%"
+          description: "单机同时跑多个回测时容易触发，考虑降低 worker 并发。"
+
+      - alert: RabbitMQQueueBacklog
+        expr: rabbitmq_queue_messages_ready{queue=~"replay|backtest|factor|optimization|maintenance"} > 50
+        for: 10m
+        labels:
+          severity: warning
+          component: mq
+        annotations:
+          summary: "RabbitMQ 队列 {{ $labels.queue }} 积压 {{ $value }}"
+          description: "消费者处理不过来，检查 worker 是否在线。"
+
+      - alert: RabbitMQDown
+        expr: up{job="rabbitmq"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          component: mq
+        annotations:
+          summary: "RabbitMQ 指标不可达"
+          description: "broker 故障时所有异步任务都会停摆。"

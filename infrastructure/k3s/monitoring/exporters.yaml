@@ -1,0 +1,451 @@
+# 主机与集群指标采集 + 日志采集
+#
+#   node-exporter       DaemonSet，每节点一个，采集 CPU / 内存 / 磁盘 / 网络
+#   kube-state-metrics  Deployment，把 K8s 对象状态转成指标（Pod 重启、副本数…）
+#   mongodb-exporter    Deployment，MongoDB 连接数、opcounters、WiredTiger 缓存
+#   promtail            DaemonSet，抓取 Pod 日志推给 Loki，并解析 run_id 等字段
+#
+# GPU 指标（DCGM exporter）默认不装：分钟级回测不依赖 GPU，只有深度学习因子才需要。
+# 需要时追加 nvidia/dcgm-exporter 的 DaemonSet 即可。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  namespace: quant-monitor
+  labels:
+    app: promtail
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: quant-promtail
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods", "pods/log", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: quant-promtail
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: quant-promtail
+subjects:
+  - kind: ServiceAccount
+    name: promtail
+    namespace: quant-monitor
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: quant-monitor
+  labels:
+    app: promtail
+data:
+  promtail-config.yaml: |
+    # Promtail 配置：抓取 K8s Pod 日志并解析结构化字段
+    #
+    # 统一日志字段（core/logging.py 的 JsonFormatter 已输出）：
+    #   run_id / strategy_id / task_id / event_sequence / simulated_time / event_type
+    # 其中低基数字段（level / logger / event_type）作为 label，
+    # 高基数字段（run_id / strategy_id / task_id / event_sequence / simulated_time）
+    # 放进 structured_metadata，避免 label 基数爆炸导致 Loki 索引膨胀。
+    #
+    # 注意：Loki 只是运行日志，回测事件的权威存储仍然是 Parquet（data_files/backtests/...）。
+    server:
+      http_listen_port: 3101
+      grpc_listen_port: 0
+      log_level: info
+
+    positions:
+      filename: /run/promtail/positions.yaml
+
+    clients:
+      - url: http://loki.quant-monitor.svc.cluster.local:3100/loki/api/v1/push
+        batchwait: 1s
+        batchsize: 1048576
+
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        pipeline_stages:
+          # K3s 使用 containerd，日志是 CRI 格式
+          - cri: {}
+          - json:
+              expressions:
+                level: level
+                logger: logger
+                message: message
+                run_id: run_id
+                strategy_id: strategy_id
+                task_id: task_id
+                event_sequence: event_sequence
+                simulated_time: simulated_time
+                event_type: event_type
+          - labels:
+              level:
+              logger:
+              event_type:
+          - structured_metadata:
+              run_id:
+              strategy_id:
+              task_id:
+              event_sequence:
+              simulated_time:
+          - timestamp:
+              source: ts
+              format: RFC3339
+              action_on_failure: skip
+        relabel_configs:
+          - source_labels: ["__meta_kubernetes_namespace"]
+            target_label: namespace
+          - source_labels: ["__meta_kubernetes_pod_name"]
+            target_label: pod
+          - source_labels: ["__meta_kubernetes_pod_container_name"]
+            target_label: container
+          - source_labels: ["__meta_kubernetes_pod_label_app"]
+            target_label: app
+          - source_labels: ["__meta_kubernetes_pod_node_name"]
+            target_label: node
+          - source_labels: ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+            target_label: "__path__"
+            replacement: "/var/log/pods/*$1/*.log"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: quant-monitor
+  labels:
+    app: promtail
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    metadata:
+      labels:
+        app: promtail
+    spec:
+      serviceAccountName: promtail
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config.file=/etc/promtail/promtail-config.yaml
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 3101
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promtail
+            - name: pods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: positions
+              mountPath: /run/promtail
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      tolerations:
+        - operator: Exists
+      volumes:
+        - name: config
+          configMap:
+            name: promtail-config
+        - name: pods
+          hostPath:
+            path: /var/log/pods
+        - name: positions
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: quant-monitor
+  labels:
+    app: node-exporter
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.8.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --path.procfs=/host/proc
+            - --path.sysfs=/host/sys
+            - --path.rootfs=/host
+            - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/kubelet/pods)($|/)
+          ports:
+            - name: metrics
+              containerPort: 9100
+              hostPort: 9100
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: sys
+              mountPath: /host/sys
+              readOnly: true
+            - name: root
+              mountPath: /host
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      tolerations:
+        - operator: Exists
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: root
+          hostPath:
+            path: /
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: quant-monitor
+  labels:
+    app: kube-state-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: quant-kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "nodes", "pods", "services", "resourcequotas", "replicationcontrollers", "limitranges", "persistentvolumeclaims", "persistentvolumes", "namespaces", "endpoints"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "daemonsets", "deployments", "replicasets"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattachments"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: quant-kube-state-metrics
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: quant-kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: quant-monitor
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: quant-monitor
+  labels:
+    app: kube-state-metrics
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: kube-state-metrics
+    spec:
+      serviceAccountName: kube-state-metrics
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=8080
+            - --resources=pods,deployments,statefulsets,jobs,namespaces,nodes,persistentvolumeclaims
+          ports:
+            - name: http-metrics
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 8081
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: telemetry
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: telemetry
+            initialDelaySeconds: 15
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: quant-monitor
+  labels:
+    app: kube-state-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: kube-state-metrics
+  ports:
+    - name: http-metrics
+      port: 8080
+      targetPort: http-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-exporter
+  namespace: quant-monitor
+  labels:
+    app: mongodb-exporter
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb-exporter
+  template:
+    metadata:
+      labels:
+        app: mongodb-exporter
+    spec:
+      containers:
+        - name: mongodb-exporter
+          image: percona/mongodb_exporter:0.40.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --discovering-mode
+            - --compatible-mode
+            - --collect-all
+            - --mongodb.uri=$(MONGODB_URI)
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: quant-mongo-exporter-uri
+                  key: uri
+          ports:
+            - name: metrics
+              containerPort: 9216
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-exporter
+  namespace: quant-monitor
+  labels:
+    app: mongodb-exporter
+spec:
+  type: ClusterIP
+  selector:
+    app: mongodb-exporter
+  ports:
+    - name: metrics
+      port: 9216
+      targetPort: metrics
+---
+# exporter 用的只读账号连接串，与业务账号分开
+apiVersion: v1
+kind: Secret
+metadata:
+  name: quant-mongo-exporter-uri
+  namespace: quant-monitor
+  labels:
+    app: mongodb-exporter
+type: Opaque
+stringData:
+  uri: "mongodb://quant_exporter:REPLACE_ME_EXPORTER_PASSWORD@mongodb.quant-data.svc.cluster.local:27017/admin?authSource=admin"

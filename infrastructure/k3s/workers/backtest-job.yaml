@@ -1,0 +1,86 @@
+# 一次性回测 Job 模板 —— 初期不启用，仅作演进参考。
+#
+# 为什么不启用（方案.md 第五章）：
+#   单机资源有限，每个回测一个 Pod 会让调度和内存峰值不可控；
+#   固定数量的 Celery Worker 已经能满足"并行跑几个回测"的需求。
+#   等任务隔离、资源配额、优先级真正成为瓶颈时，再改成 Job / Indexed Job 模式。
+#
+# 本文件没有纳入 kustomization.yaml，需要时手动执行：
+#   kubectl apply -f infrastructure/k3s/workers/backtest-job.yaml
+#   kubectl -n quant-core logs -f job/backtest-run-202611110001
+#
+# 使用前请把 run-id / strategy / 日期范围换成真实值，并确保 data PVC 里已有数据集。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backtest-run-202611110001
+  namespace: quant-core
+  labels:
+    app: backtest-job
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  # suspend: true 让 Job 创建后不实际拉起 Pod，避免误 apply 时白跑一次回测。
+  # 真正执行时把 suspend 改成 false 再 apply。
+  suspend: true
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: backtest-job
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: backtest
+          image: ghcr.io/quant-replay/quant-replay-worker:1.0.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -m
+            - apps.worker.run_backtest
+            - --run-id
+            - "202611110001"
+            - --strategy
+            - sma_cross
+            - --symbols
+            - "000001.SZ,600000.SH"
+            - --start
+            - "2025-01-02"
+            - --end
+            - "2025-01-31"
+            - --dataset-version
+            - v001
+          envFrom:
+            - configMapRef:
+                name: quant-config
+            - secretRef:
+                name: quant-secret
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: quant-data
+        - name: tmp
+          emptyDir: {}

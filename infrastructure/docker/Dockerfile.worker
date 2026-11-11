@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------------------------
+# Celery Worker 镜像（与 api / web 共用同一个 base 层）
+#   docker build -f infrastructure/docker/Dockerfile.worker -t quant-replay-worker:1.0.0 .
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 共享基础层（base）
+#
+# 三个镜像（api / worker / web）都从同一个 base stage 出发：相同的 apt 包、
+# 相同的 Python 依赖、相同的非 root 用户、相同的 tini 作为 PID 1。
+# 因为这段内容在三个 Dockerfile 中逐字一致，Docker 的层缓存和 registry 中的
+# blob 会在三个镜像之间复用，不会重复占用磁盘。
+#
+# 构建上下文必须是仓库根目录：
+#   docker build -f infrastructure/docker/Dockerfile.api -t quant-replay-api:1.0.0 .
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/opt/quant \
+    TZ=Asia/Shanghai \
+    QUANT_HOME=/opt/quant \
+    QUANT_DATA_ROOT=/data
+
+# curl: 健康检查用；tini: 正确转发 SIGTERM，Celery / uvicorn 才能优雅退出
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl tini \
+ && rm -rf /var/lib/apt/lists/*
+
+# 非 root 用户，uid/gid 固定，K8s securityContext 里用 runAsUser: 10001 对应
+RUN groupadd --gid 10001 quant \
+ && useradd --uid 10001 --gid quant --create-home --shell /usr/sbin/nologin quant \
+ && mkdir -p /data /opt/quant \
+ && chown -R quant:quant /data /opt/quant
+
+WORKDIR /opt/quant
+
+# 依赖层单独缓存：只有 pyproject.toml 里的 dependencies 变化才会重新安装。
+# 直接从 pyproject.toml 读出依赖列表，避免为了缓存而提前复制源码。
+COPY pyproject.toml ./
+RUN python -c "import pathlib, tomllib; d = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print('\n'.join(d['project']['dependencies']))" > /tmp/requirements.txt \
+ && pip install --no-cache-dir -r /tmp/requirements.txt \
+ && rm -f /tmp/requirements.txt
+
+# 代码里的默认相对路径是 data_files / data_files/backtests，
+# 容器里统一挂载到 /data，用符号链接让两套写法指向同一个目录。
+RUN ln -s /data /opt/quant/data_files
+
+# 应用源码（.dockerignore 已排除 .venv / data_files / .git / tests 等）
+COPY --chown=10001:10001 . .
+RUN pip install --no-cache-dir --no-deps .
+
+USER 10001:10001
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# 回测产物、行情数据都写在这里；K8s 中由 PVC / hostPath 挂载覆盖
+VOLUME ["/data"]
+
+# 健康检查用 celery inspect ping：broker 不可达时返回非 0
+HEALTHCHECK --interval=60s --timeout=15s --start-period=60s --retries=3 \
+    CMD celery -A apps.worker.celery_app inspect ping -d "celery@$(hostname)" --timeout 10 >/dev/null 2>&1 || exit 1
+
+# 队列与并发数按单机资源预算设定（见 方案.md 第十章）：
+# 回测 Worker 4~8Gi，并发 2，避免同时跑满内存
+CMD ["celery", "-A", "apps.worker.celery_app", "worker", \
+     "-Q", "replay,backtest,factor,optimization,maintenance", \
+     "-c", "2", "-l", "info", \
+     "--max-tasks-per-child", "200"]

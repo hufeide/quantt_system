@@ -1,0 +1,55 @@
+# Namespace 只是逻辑隔离：单节点上所有 Pod 仍然共享同一台机器的 CPU / 内存 / 磁盘。
+# 按 方案.md 第二章的职责划分：
+#   ingress       Nginx Ingress Controller（统一入口）
+#   quant-app     FastAPI + Streamlit
+#   quant-core    Replay / Backtest Worker
+#   quant-mq      RabbitMQ + Redis + Celery 相关
+#   quant-data    MongoDB + 行情 / 回测产物
+#   quant-monitor Prometheus / Grafana / Loki / Exporter
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress
+  labels:
+    name: ingress
+    app.kubernetes.io/part-of: quant-replay
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quant-app
+  labels:
+    name: quant-app
+    app.kubernetes.io/part-of: quant-replay
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quant-core
+  labels:
+    name: quant-core
+    app.kubernetes.io/part-of: quant-replay
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quant-mq
+  labels:
+    name: quant-mq
+    app.kubernetes.io/part-of: quant-replay
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quant-data
+  labels:
+    name: quant-data
+    app.kubernetes.io/part-of: quant-replay
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quant-monitor
+  labels:
+    name: quant-monitor
+    app.kubernetes.io/part-of: quant-replay

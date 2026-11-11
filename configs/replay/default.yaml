@@ -1,0 +1,9 @@
+# 示例：交互式回放配置
+frequency: "1m"
+dataset_version: "v001"
+data_root: "data_files"
+speed: 10          # 回放倍速，0 表示不限速
+checkpoint_interval_seconds: 60
+max_events_per_step: 500
+symbols:
+  - "600000.SH"

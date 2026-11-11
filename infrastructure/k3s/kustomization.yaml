@@ -1,0 +1,36 @@
+# 一次性部署（在仓库根目录执行）：
+#   kubectl apply -k infrastructure/k3s
+#   或  bash scripts/deploy.sh   （额外生成 Grafana 数据源与仪表盘 ConfigMap）
+#
+# 刻意没有包含的清单（按需手动 apply）：
+#   databases/redis.yaml        缓存/锁，初期不需要
+#   workers/backtest-job.yaml   一次性回测 Job 模板，初期不启用
+#   ingress/nginx-ingress-values.yaml  这是 Helm values，不是 K8s 资源
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespaces/namespaces.yaml
+  - applications/configmap.yaml
+  - applications/secret.yaml
+  - applications/api.yaml
+  - applications/web.yaml
+  - workers/backtest-worker.yaml
+  - databases/pvc-data.yaml
+  - databases/mongodb.yaml
+  - databases/rabbitmq.yaml
+  - monitoring/prometheus.yaml
+  - monitoring/grafana.yaml
+  - monitoring/loki.yaml
+  - monitoring/exporters.yaml
+  - ingress/quant-ingress.yaml
+
+# 统一改镜像 tag：kubectl apply -k infrastructure/k3s 之前改这里，或用
+#   kubectl kustomize infrastructure/k3s | sed 's/:1.0.0/:1.0.1/' | kubectl apply -f -
+images:
+  - name: ghcr.io/quant-replay/quant-replay-api
+    newTag: "1.0.0"
+  - name: ghcr.io/quant-replay/quant-replay-worker
+    newTag: "1.0.0"
+  - name: ghcr.io/quant-replay/quant-replay-web
+    newTag: "1.0.0"

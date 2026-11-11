@@ -1,0 +1,68 @@
+# Promtail 配置：抓取 K8s Pod 日志并解析结构化字段
+#
+# 统一日志字段（core/logging.py 的 JsonFormatter 已输出）：
+#   run_id / strategy_id / task_id / event_sequence / simulated_time / event_type
+# 其中低基数字段（level / logger / event_type）作为 label，
+# 高基数字段（run_id / strategy_id / task_id / event_sequence / simulated_time）
+# 放进 structured_metadata，避免 label 基数爆炸导致 Loki 索引膨胀。
+#
+# 注意：Loki 只是运行日志，回测事件的权威存储仍然是 Parquet（data_files/backtests/...）。
+server:
+  http_listen_port: 3101
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /run/promtail/positions.yaml
+
+clients:
+  - url: http://loki.quant-monitor.svc.cluster.local:3100/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576
+
+scrape_configs:
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+    pipeline_stages:
+      # K3s 使用 containerd，日志是 CRI 格式
+      - cri: {}
+      - json:
+          expressions:
+            level: level
+            logger: logger
+            message: message
+            run_id: run_id
+            strategy_id: strategy_id
+            task_id: task_id
+            event_sequence: event_sequence
+            simulated_time: simulated_time
+            event_type: event_type
+      - labels:
+          level:
+          logger:
+          event_type:
+      - structured_metadata:
+          run_id:
+          strategy_id:
+          task_id:
+          event_sequence:
+          simulated_time:
+      - timestamp:
+          source: ts
+          format: RFC3339
+          action_on_failure: skip
+    relabel_configs:
+      - source_labels: ["__meta_kubernetes_namespace"]
+        target_label: namespace
+      - source_labels: ["__meta_kubernetes_pod_name"]
+        target_label: pod
+      - source_labels: ["__meta_kubernetes_pod_container_name"]
+        target_label: container
+      - source_labels: ["__meta_kubernetes_pod_label_app"]
+        target_label: app
+      - source_labels: ["__meta_kubernetes_pod_node_name"]
+        target_label: node
+      - source_labels: ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        target_label: "__path__"
+        replacement: "/var/log/pods/*$1/*.log"

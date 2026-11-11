@@ -1,0 +1,144 @@
+# RabbitMQ：Celery 的消息队列
+# 同时开启 management（15672）和 prometheus（15692）插件，供 Grafana 的 RabbitMQ 面板使用。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-config
+  namespace: quant-mq
+  labels:
+    app: rabbitmq
+    app.kubernetes.io/part-of: quant-replay
+data:
+  enabled_plugins: |
+    [rabbitmq_management,rabbitmq_prometheus].
+  rabbitmq.conf: |
+    # 单机 + 少量 Worker，预取 1 让任务分配更均匀
+    consumer_timeout = 1800000
+    channel_max = 2047
+    default_vhost = /
+    management.tcp.port = 15672
+    prometheus.tcp.port = 15692
+    # 内存水位：容器限制 1Gi 时，超过 0.6 会开始阻塞生产者而不是被 OOMKill
+    vm_memory_high_watermark.relative = 0.6
+    disk_free_limit.absolute = 1GB
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: quant-mq
+  labels:
+    app: rabbitmq
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: amqp
+    - name: management
+      port: 15672
+      targetPort: management
+    - name: metrics
+      port: 15692
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: quant-mq
+  labels:
+    app: rabbitmq
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: amqp
+              containerPort: 5672
+              protocol: TCP
+            - name: management
+              containerPort: 15672
+              protocol: TCP
+            - name: metrics
+              containerPort: 15692
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: quant-mq-secret
+          env:
+            - name: RABBITMQ_ENABLED_PLUGINS_FILE
+              value: /etc/rabbitmq/conf/enabled_plugins
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+            - name: config
+              mountPath: /etc/rabbitmq/conf
+          resources:
+            # 方案.md 第十章：RabbitMQ 预算 0.5~1Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: config
+          configMap:
+            name: rabbitmq-config
+            items:
+              - key: enabled_plugins
+                path: enabled_plugins
+              - key: rabbitmq.conf
+                path: rabbitmq.conf
+      terminationGracePeriodSeconds: 60
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi

@@ -1,0 +1,73 @@
+# 行情数据与回测产物的共享存储（单节点方案）。
+#
+# 单机 K3s 没有共享文件系统，但 api 和 worker 必须看到同一份 Parquet，
+# 因此用 hostPath PV 指向宿主机目录，再在两个 namespace 各挂一个 PVC。
+# 注意：同一个 PV 只能被一个 PVC 绑定，所以这里建两个 PV 指向同一个 hostPath。
+#
+# 宿主机目录：/var/lib/quant-data（WSL2 内，不要放在 /mnt/c 上，IO 会慢一个数量级）
+# 生产多节点时替换为 NFS / Longhorn / 对象存储。
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: quant-data-pv-app
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: quant-local
+  hostPath:
+    path: /var/lib/quant-data
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: quant-data-pv-core
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: quant-local
+  hostPath:
+    path: /var/lib/quant-data
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: quant-data
+  namespace: quant-app
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: quant-local
+  volumeName: quant-data-pv-app
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: quant-data
+  namespace: quant-core
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: quant-local
+  volumeName: quant-data-pv-core
+  resources:
+    requests:
+      storage: 100Gi

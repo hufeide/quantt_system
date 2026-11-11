@@ -1,0 +1,123 @@
+# 常驻 Celery Worker（Deployment 模式）
+#
+# 设计要点（方案.md 第五章）：
+# - K3s 管理进程，Celery 管理任务，回测核心负责计算，三者职责不混。
+# - 初期用固定数量 Worker 消费队列，不为每次回测创建 Job。
+# - 单机内存有限，并发固定为 2，且 max-tasks-per-child 防止内存缓慢泄漏。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backtest-worker
+  namespace: quant-core
+  labels:
+    app: backtest-worker
+    app.kubernetes.io/name: backtest-worker
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: backtest-worker
+  template:
+    metadata:
+      labels:
+        app: backtest-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9108"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: worker
+          image: ghcr.io/quant-replay/quant-replay-worker:1.0.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - celery
+            - -A
+            - apps.worker.celery_app
+            - worker
+            - -Q
+            - replay,backtest,factor,optimization,maintenance
+            - -c
+            - "2"
+            - -l
+            - info
+            - --max-tasks-per-child
+            - "200"
+          envFrom:
+            - configMapRef:
+                name: quant-config
+            - secretRef:
+                name: quant-secret
+          env:
+            # Celery 配置来自 configmap/secret（CELERY_BROKER_URL / CELERY_RESULT_BACKEND）
+            # 并发数用命令行 -c 2 固定，与 CELERY_CONCURRENCY 保持一致
+            - name: CELERY_CONCURRENCY
+              value: "2"
+            # prefork 模式下 prometheus_client 的计数器在子进程里累加，
+            # 必须指定 multiprocess 目录，否则父进程的 /metrics 看不到子进程的计数
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: "/tmp/prometheus-multiproc"
+            # 优雅退出：K8s 发 SIGTERM 后给 Celery 时间把手上的回测跑完或回滚
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: metrics
+              containerPort: 9108
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            # 单独挂一个 emptyDir 给 prometheus multiprocess 文件，避免和 /tmp 其他内容混在一起
+            - name: multiproc
+              mountPath: /tmp/prometheus-multiproc
+          resources:
+            # 回测 Worker 是内存大户：单次分钟级回测 1~3Gi 很常见。
+            # requests 2Gi 保证能调度，limits 6Gi 留出峰值；若做参数优化，
+            # 建议把 limits 提到 8Gi，并相应减少并发（-c 1）。
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - celery -A apps.worker.celery_app inspect ping -d celery@$(hostname) --timeout 10
+            failureThreshold: 30
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - celery -A apps.worker.celery_app inspect ping -d celery@$(hostname) --timeout 10
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: quant-data
+        - name: tmp
+          emptyDir: {}
+        - name: multiproc
+          emptyDir: {}
+      # 必须 > 单个回测任务的执行时间上限，否则滚动更新会杀掉正在跑的回测
+      terminationGracePeriodSeconds: 60

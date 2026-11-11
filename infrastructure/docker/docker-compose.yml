@@ -1,0 +1,149 @@
+# 本地开发用 Docker Compose：有状态中间件 + 三个应用容器。
+# 用法：
+#   cd infrastructure/docker && cp .env.example .env && docker compose up -d --build
+#   浏览器访问 http://localhost:8501 （Web）、http://localhost:8000/docs （API）
+#
+# 说明：
+# - 生产 / 单机正式环境请用 K3s 清单（infrastructure/k3s），这里只做本地联调。
+# - 依赖顺序通过 healthcheck + depends_on.condition 保证：mongo/rabbitmq 健康后才起 api。
+# - 数据目录绑定到仓库的 data_files/，与本地 python 运行共用同一份 Parquet 数据。
+# - 变量名与代码一致：apps/api/settings.py 用 QUANT_ 前缀，apps/worker 读 CELERY_* 与 QR_DATA_ROOT。
+name: quant-replay
+
+x-app-env: &app-env
+  QUANT_ENV: dev
+  QUANT_LOG_LEVEL: INFO
+  QUANT_LOG_JSON: "true"
+  TZ: Asia/Shanghai
+  # API / Web 用 QUANT_*，worker 的 tasks.py 额外读 QR_DATA_ROOT / QR_OUTPUT_ROOT
+  QUANT_DATA_ROOT: /data
+  QUANT_OUTPUT_ROOT: /data/backtests
+  QR_DATA_ROOT: /data
+  QR_OUTPUT_ROOT: /data/backtests
+  QUANT_DATASET_VERSION: ${QUANT_DATASET_VERSION:-v001}
+  QUANT_MONGO_DB: ${MONGO_DB:-quant}
+  QUANT_MONGO_URI: mongodb://${MONGO_USER:-quant}:${MONGO_PASSWORD:-quant_dev_pwd}@mongodb:27017/?authSource=admin
+  QUANT_RABBITMQ_URL: amqp://${RABBITMQ_USER:-quant}:${RABBITMQ_PASSWORD:-quant_dev_pwd}@rabbitmq:5672//
+  QUANT_CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-quant}:${RABBITMQ_PASSWORD:-quant_dev_pwd}@rabbitmq:5672//
+  CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-quant}:${RABBITMQ_PASSWORD:-quant_dev_pwd}@rabbitmq:5672//
+  CELERY_RESULT_BACKEND: rpc://
+  CELERY_CONCURRENCY: "2"
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: quant-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-quant}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-quant_dev_pwd}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-quant}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin | grep -q 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: quant-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-quant}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-quant_dev_pwd}
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # 管理界面 http://localhost:15672
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.api
+    image: quant-replay-api:dev
+    container_name: quant-api
+    restart: unless-stopped
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../../data_files:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.worker
+    image: quant-replay-worker:dev
+    container_name: quant-worker
+    restart: unless-stopped
+    environment: *app-env
+    command:
+      - celery
+      - -A
+      - apps.worker.celery_app
+      - worker
+      - -Q
+      - replay,backtest,factor,optimization,maintenance
+      - -c
+      - "2"
+      - -l
+      - info
+    volumes:
+      - ../../data_files:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.web
+    image: quant-replay-web:dev
+    container_name: quant-web
+    restart: unless-stopped
+    environment:
+      # web 直接访问 api 容器（走无前缀规范路由），前缀留空
+      QUANT_API_BASE_URL: http://api:8000
+      QR_API_PREFIX: ""
+      QUANT_DATA_ROOT: /data
+      QUANT_OUTPUT_ROOT: /data/backtests
+      QUANT_LOG_LEVEL: INFO
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../../data_files:/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  rabbitmq-data:

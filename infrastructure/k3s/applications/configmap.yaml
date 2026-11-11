@@ -1,0 +1,72 @@
+# 非敏感配置。
+#
+# 变量命名以代码为准：
+#   apps/api/settings.py   -> pydantic-settings，env_prefix="QUANT_"
+#   apps/web/backend.py    -> QUANT_API_BASE_URL（QR_API_* 为兼容别名）
+#   apps/worker/tasks.py   -> QR_DATA_ROOT / QR_OUTPUT_ROOT 作为任务默认根目录
+# 本地 .env、docker-compose 与 K8s 使用同一套名字。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quant-config
+  namespace: quant-app
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+data:
+  QUANT_ENV: "prod"
+  QUANT_LOG_LEVEL: "INFO"
+  QUANT_LOG_JSON: "true"
+  TZ: "Asia/Shanghai"
+
+  # ---- 存储 ----
+  QUANT_DATA_ROOT: "/data"
+  QUANT_OUTPUT_ROOT: "/data/backtests"
+  QUANT_DATASET_VERSION: "v001"
+  QUANT_MONGO_DB: "quant"
+
+  # ---- 服务发现（集群内 DNS）----
+  # web 直接访问 api Service（不走 Ingress），因此不能带 /api 前缀
+  QUANT_API_BASE_URL: "http://api.quant-app.svc.cluster.local:8000"
+  QUANT_PROMETHEUS_URL: "http://prometheus.quant-monitor.svc.cluster.local:9090"
+  QUANT_LOKI_URL: "http://loki.quant-monitor.svc.cluster.local:3100"
+
+  # ---- 任务调度 ----
+  QUANT_MAX_WORKERS: "2"
+  QUANT_CELERY_RESULT_BACKEND: "rpc://"
+
+  # ---- 可观测性 ----
+  QUANT_PROMETHEUS_ENABLED: "true"
+  QUANT_METRICS_PORT: "8000"
+---
+# worker 在 quant-core，跨 namespace 不能直接引用 ConfigMap，复制一份。
+# 额外多了 QUANT_METRICS_PORT=9108（worker 进程内 /metrics）与 QR_DATA_ROOT / QR_OUTPUT_ROOT
+# （apps/worker/tasks.py 读这两个名字作为任务默认根目录）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quant-config
+  namespace: quant-core
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+data:
+  QUANT_ENV: "prod"
+  QUANT_LOG_LEVEL: "INFO"
+  QUANT_LOG_JSON: "true"
+  TZ: "Asia/Shanghai"
+
+  QUANT_DATA_ROOT: "/data"
+  QUANT_OUTPUT_ROOT: "/data/backtests"
+  QR_DATA_ROOT: "/data"
+  QR_OUTPUT_ROOT: "/data/backtests"
+  QUANT_DATASET_VERSION: "v001"
+  QUANT_MONGO_DB: "quant"
+
+  QUANT_API_BASE_URL: "http://api.quant-app.svc.cluster.local:8000"
+  QUANT_PROMETHEUS_URL: "http://prometheus.quant-monitor.svc.cluster.local:9090"
+  QUANT_LOKI_URL: "http://loki.quant-monitor.svc.cluster.local:3100"
+
+  QUANT_MAX_WORKERS: "2"
+  QUANT_CELERY_RESULT_BACKEND: "rpc://"
+
+  QUANT_PROMETHEUS_ENABLED: "true"
+  QUANT_METRICS_PORT: "9108"

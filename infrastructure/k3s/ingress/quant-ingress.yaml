@@ -1,0 +1,157 @@
+# 统一入口（Nginx Ingress）
+#
+#   http://localhost/          -> web:8501          （量化平台）
+#   http://localhost/api/...   -> api:8000/...      （/api 前缀被 rewrite 掉）
+#   http://localhost/docs      -> api:8000/docs     （Swagger UI，不 rewrite）
+#   http://localhost/openapi.json -> api:8000/openapi.json
+#   http://localhost/grafana/  -> grafana:3000      （不 rewrite，见下方说明）
+#   http://localhost/prometheus/ -> prometheus:9090
+#
+# 注意：Ingress 的后端 Service 必须与 Ingress 在同一个 namespace，
+# 所以这里分成 quant-app 与 quant-monitor 两个 Ingress 对象。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: quant-web
+  namespace: quant-app
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 8501
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: quant-api
+  namespace: quant-app
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    # /api/backtests -> /backtests
+    # FastAPI 的规范路由不带前缀（apps/api/main.py 的 include_router(router)），
+    # /api 只是给直连客户端保留的 include_in_schema=False 别名。
+    # 对外统一暴露 /api，内部走无前缀路由。
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: localhost
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+---
+# Swagger UI 与 OpenAPI schema 单独暴露：前端 /docs 页面会按根路径去拉 /openapi.json，
+# 如果也做 rewrite，页面里的 "Try it out" 会 404。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: quant-api-docs
+  namespace: quant-app
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: localhost
+      http:
+        paths:
+          - path: /docs
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /redoc
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /openapi.json
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+---
+# Grafana 走子路径：不 rewrite。
+# Grafana 配了 GF_SERVER_SERVE_FROM_SUB_PATH=true，它自己知道前缀是 /grafana，
+# 如果把前缀剥掉，页面里的静态资源（/grafana/public/...）就会 404。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: quant-monitor
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: localhost
+      http:
+        paths:
+          - path: /grafana
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+---
+# Prometheus 以 --web.external-url=http://localhost/prometheus 启动，
+# route-prefix 自动是 /prometheus，因此同样不 rewrite。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus
+  namespace: quant-monitor
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: localhost
+      http:
+        paths:
+          - path: /prometheus
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  number: 9090

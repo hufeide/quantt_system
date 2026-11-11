@@ -1,0 +1,111 @@
+# MongoDB：业务元数据（策略、任务、回测 manifest、配置）
+#
+# 单节点 StatefulSet + local-path PVC。单机阶段不需要副本集，
+# 但必须配置持久化卷和备份（见 docs/OPERATIONS.md 的备份章节）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: quant-data
+  labels:
+    app: mongodb
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  type: ClusterIP
+  clusterIP: None   # headless，StatefulSet 的稳定网络标识
+  selector:
+    app: mongodb
+  ports:
+    - name: mongodb
+      port: 27017
+      targetPort: mongodb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: quant-data
+  labels:
+    app: mongodb
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  serviceName: mongodb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      containers:
+        - name: mongodb
+          image: mongo:7.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --bind_ip_all
+            - --wiredTigerCacheSizeGB
+            - "1"
+          ports:
+            - name: mongodb
+              containerPort: 27017
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: quant-db-secret
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          resources:
+            # 方案.md 第十章：MongoDB 预算 2~4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' -u $MONGO_INITDB_ROOT_USERNAME -p $MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' -u $MONGO_INITDB_ROOT_USERNAME -p $MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' -u $MONGO_INITDB_ROOT_USERNAME -p $MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+      terminationGracePeriodSeconds: 60
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-path   # K3s 自带 local-path-provisioner
+        resources:
+          requests:
+            storage: 20Gi

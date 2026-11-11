@@ -1,0 +1,54 @@
+# Nginx Ingress Controller 的 Helm values
+#
+# 安装：
+#   helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+#   helm repo update
+#   helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+#     --namespace ingress --create-namespace \
+#     -f infrastructure/k3s/ingress/nginx-ingress-values.yaml --wait
+#
+# 为什么用 hostNetwork + DaemonSet（单节点 K3s + WSL2）：
+#   - 直接占用节点的 80/443，Windows 浏览器访问 http://localhost/ 即可，
+#     不需要再记一个 30080 之类的 NodePort。
+#   - 少一层 kube-proxy 转发，单机场景更直观。
+#   - 如果 80/443 被占用（比如另一个 Docker 容器），把 hostNetwork 改回 false，
+#     用下面的 nodePort 30080/30443 访问。
+controller:
+  kind: DaemonSet
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  service:
+    type: NodePort
+    nodePorts:
+      http: 30080
+      https: 30443
+  # 单机资源预算：入口层 0.25~0.5Gi 足够
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # 回测结果上传、大 Parquet 上传都可能超过默认 1m
+  config:
+    proxy-body-size: "64m"
+    proxy-read-timeout: "300"
+    proxy-send-timeout: "300"
+    client-max-body-size: "64m"
+    use-forwarded-headers: "true"
+    compute-full-forwarded-for: "true"
+    log-format-upstream: '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_length $request_time [$proxy_upstream_name] [$proxy_alt_upstream_name] $upstream_addr $upstream_response_length $upstream_response_time $req_id'
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false   # 本方案用静态 scrape，不引入 prometheus-operator
+  # 单节点不需要 PDB 的优雅驱逐语义，但保留默认即可
+  replicaCount: 1
+  # 健康检查探针沿用 chart 默认值
+  admissionWebhooks:
+    enabled: true
+    patch:
+      enabled: true
+defaultBackend:
+  enabled: false

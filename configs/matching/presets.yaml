@@ -1,0 +1,21 @@
+# 撮合规则预设
+defaults: &defaults
+  slippage_bps: 1.0
+  participation_rate: 0.1
+  lot_size: 100
+  price_limit_pct: 0.10
+  allow_partial_fill: true
+  t_plus_1: true
+  fill_on_same_bar: false
+
+presets:
+  a_share_minute: *defaults
+  conservative:
+    <<: *defaults
+    slippage_bps: 5.0
+    participation_rate: 0.02
+  aggressive:
+    <<: *defaults
+    slippage_bps: 0.0
+    participation_rate: 0.5
+    allow_partial_fill: false

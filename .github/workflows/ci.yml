@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# 同一分支的新提交会取消上一次还在跑的流水线
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  # 测试用的中间件连接串（GitHub Actions service container）
+  QUANT_ENV: ci
+  QUANT_LOG_JSON: "true"
+  QUANT_MONGO_URI: mongodb://quant:quant_ci_pwd@localhost:27017/?authSource=admin
+  QUANT_MONGO_DB: quant_ci
+  QUANT_RABBITMQ_URL: amqp://quant:quant_ci_pwd@localhost:5672//
+  QUANT_CELERY_BROKER_URL: amqp://quant:quant_ci_pwd@localhost:5672//
+  QUANT_DATA_ROOT: ./data_files
+  QUANT_DATASET_VERSION: v001
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 代码检查
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+      - name: ruff format 检查（仅提示，不阻塞）
+        continue-on-error: true
+        run: ruff format --check .
+
+  # ---------------------------------------------------------------------------
+  # 2. 单元测试 + 集成测试
+  # ---------------------------------------------------------------------------
+  test:
+    name: Pytest (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: unit
+            path: tests/unit
+          - suite: integration
+            path: tests/integration
+    services:
+      mongodb:
+        image: mongo:7.0
+        env:
+          MONGO_INITDB_ROOT_USERNAME: quant
+          MONGO_INITDB_ROOT_PASSWORD: quant_ci_pwd
+          MONGO_INITDB_DATABASE: quant_ci
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' -u quant -p quant_ci_pwd --authenticationDatabase admin"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: quant
+          RABBITMQ_DEFAULT_PASS: quant_ci_pwd
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 准备数据目录
+        run: mkdir -p data_files/backtests reports
+
+      - name: 运行 ${{ matrix.suite }} 测试
+        run: |
+          pytest ${{ matrix.path }} -q --junitxml=reports/${{ matrix.suite }}.xml
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-${{ matrix.suite }}
+          path: reports/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3. Golden Backtest 对比
+  #    固定数据集 + 固定策略 + 固定参数，比对交易数、成交价、手续费、
+  #    资金曲线、收益率、最大回撤。核心代码改动导致结果漂移时必须在这里暴露。
+  # ---------------------------------------------------------------------------
+  golden:
+    name: Golden Backtest
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 准备目录
+        run: mkdir -p data_files/backtests
+
+      - name: 运行 golden backtest 并对比
+        # 基线文件由 run_golden.py --update 生成（tests/golden_backtest/expected_metrics.json），
+        # 默认容差 1e-6；核心代码改动导致成交/资金曲线漂移时这里会失败。
+        run: python scripts/run_golden.py --check --tolerance 1e-6
+
+      - name: 上传 golden 产物（便于排查结果漂移）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-backtest-artifacts
+          path: |
+            data_files/backtests/
+            tests/golden_backtest/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 4. 构建镜像（main 分支推送 ghcr.io，PR 只构建不推送）
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    needs: [test, golden]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: infrastructure/docker/Dockerfile.api
+          - name: worker
+            dockerfile: infrastructure/docker/Dockerfile.worker
+          - name: web
+            dockerfile: infrastructure/docker/Dockerfile.web
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/quant-replay-${{ matrix.name }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=1.0.0,enable={{is_default_branch}}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: false
+
+      - name: 冒烟测试（api 镜像能 import app）
+        if: matrix.name == 'api' && github.event_name != 'pull_request'
+        run: |
+          docker run --rm --entrypoint python \
+            ghcr.io/${{ github.repository_owner }}/quant-replay-api:1.0.0 \
+            -c "import apps.api.main; print('api import ok')"

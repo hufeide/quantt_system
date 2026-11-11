@@ -1,0 +1,119 @@
+# Streamlit Web UI
+#
+# 镜像构建：docker build -f infrastructure/docker/Dockerfile.web -t quant-replay-web:1.0.0 .
+# Streamlit 的浏览器端不直接访问 api 的集群内地址，而是走 Ingress 的 /api 前缀，
+# 容器内进程间调用则用 QUANT_API_BASE_URL（configmap 里配的是集群 DNS）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: quant-app
+  labels:
+    app: web
+    app.kubernetes.io/name: web
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: web
+          image: ghcr.io/quant-replay/quant-replay-web:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8501
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: quant-config
+          env:
+            # apps/web/backend.py 优先读 QUANT_API_BASE_URL，QR_API_URL 只是兜底。
+            # 容器内直连 api Service（不走 Ingress），因此不能带 /api 前缀。
+            - name: QUANT_API_BASE_URL
+              value: "http://api.quant-app.svc.cluster.local:8000"
+            # 前缀置空：直连 api Service 时走 FastAPI 的无前缀规范路由
+            - name: QR_API_PREFIX
+              value: ""
+            # Web 的结果分析直接读本地磁盘，必须与 API/Worker 用同一份数据卷
+            - name: QUANT_DATA_ROOT
+              value: "/data"
+            - name: QUANT_OUTPUT_ROOT
+              value: "/data/backtests"
+            - name: STREAMLIT_SERVER_ENABLE_CORS
+              value: "false"
+            - name: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+              value: "false"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: quant-data
+        - name: tmp
+          emptyDir: {}
+      terminationGracePeriodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: quant-app
+  labels:
+    app: web
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 8501
+      targetPort: http
+      protocol: TCP

@@ -1,0 +1,399 @@
+# Prometheus（单副本，local-path PVC）
+#
+# 抓取目标：
+#   1. kubernetes-pods  —— 通过 Pod 注解自动发现 api / worker 的 /metrics
+#   2. node-exporter / kube-state-metrics / rabbitmq / mongodb-exporter
+# 告警规则来自 ConfigMap 中的 alerts.yml（与 infrastructure/monitoring/prometheus/alerts.yml 一致）。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: quant-monitor
+  labels:
+    app: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: quant-prometheus
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/metrics", "nodes/proxy", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: quant-prometheus
+  labels:
+    app.kubernetes.io/part-of: quant-replay
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: quant-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: quant-monitor
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: quant-monitor
+  labels:
+    app: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: quant-single-node
+        environment: prod
+
+    rule_files:
+      - /etc/prometheus/rules/alerts.yml
+
+    scrape_configs:
+      # 应用自身指标：靠 Pod 注解 prometheus.io/scrape=true 自动发现
+      # （api / worker 都带这个注解，见 applications/api.yaml、workers/backtest-worker.yaml）
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: replace
+            target_label: app
+
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: node-exporter
+          - source_labels: [__meta_kubernetes_pod_ip]
+            action: replace
+            target_label: __address__
+            replacement: $1:9100
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: instance
+
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: ["kube-state-metrics.quant-monitor.svc.cluster.local:8080"]
+
+      - job_name: rabbitmq
+        static_configs:
+          - targets: ["rabbitmq.quant-mq.svc.cluster.local:15692"]
+
+      - job_name: mongodb
+        static_configs:
+          - targets: ["mongodb-exporter.quant-monitor.svc.cluster.local:9216"]
+
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+  alerts.yml: |
+    groups:
+      - name: quant-backtest
+        rules:
+          - alert: BacktestFailureRateHigh
+            expr: |
+              sum(rate(quant_backtest_runs_total{status="failed"}[10m]))
+                / clamp_min(sum(rate(quant_backtest_runs_total{status=~"success|failed"}[10m])), 0.001) > 0.2
+            for: 10m
+            labels:
+              severity: warning
+              component: worker
+            annotations:
+              summary: "回测失败率超过 20%"
+              description: "最近 10 分钟回测失败率 {{ $value | humanizePercentage }}，检查 worker 日志中的 exception 字段。"
+
+          - alert: BacktestQueueBacklog
+            expr: sum(quant_backtest_queue_depth{queue="backtest"}) > 20
+            for: 15m
+            labels:
+              severity: warning
+              component: mq
+            annotations:
+              summary: "回测队列积压 {{ $value }} 个任务"
+              description: "队列持续积压 15 分钟以上，可能需要扩容 worker 或降低并发。"
+
+          - alert: BacktestQueueStalled
+            expr: |
+              sum(rate(quant_bars_processed_total[5m])) == 0
+                and sum(quant_backtest_queue_depth{queue="backtest"}) > 0
+            for: 10m
+            labels:
+              severity: critical
+              component: worker
+            annotations:
+              summary: "队列有任务但没有 Bar 被处理"
+              description: "worker 可能卡死或与 broker 断连，检查 celery inspect active。"
+
+          - alert: BacktestDurationP95High
+            expr: histogram_quantile(0.95, sum(rate(quant_backtest_duration_seconds_bucket[30m])) by (le)) > 1800
+            for: 30m
+            labels:
+              severity: warning
+              component: worker
+            annotations:
+              summary: "回测 P95 耗时超过 30 分钟"
+              description: "回测明显变慢，检查是否发生内存换页或数据集过大。"
+
+      - name: quant-data
+        rules:
+          - alert: DataLagHigh
+            expr: max(quant_data_lag_seconds) > 86400
+            for: 30m
+            labels:
+              severity: warning
+              component: data
+            annotations:
+              summary: "行情数据延迟 {{ $value | humanizeDuration }}"
+              description: "最新可用 Bar 与当前时间差距过大，检查数据接入任务。"
+
+          - alert: DataMissingMinutesHigh
+            expr: max(quant_data_missing_minutes) > 5
+            for: 15m
+            labels:
+              severity: warning
+              component: data
+            annotations:
+              summary: "交易日缺失分钟数 {{ $value }}"
+              description: "数据校验发现缺失 Bar，可能影响回测结果的可信度。"
+
+          - alert: DataDuplicateBars
+            expr: max(quant_data_duplicate_bars) > 0
+            for: 10m
+            labels:
+              severity: warning
+              component: data
+            annotations:
+              summary: "检测到重复 Bar"
+              description: "同一 symbol+时间戳出现多条记录，请检查标准化流程的去重逻辑。"
+
+      - name: quant-platform
+        rules:
+          - alert: ApiDown
+            expr: up{job="kubernetes-pods",app="api"} == 0
+            for: 2m
+            labels:
+              severity: critical
+              component: api
+            annotations:
+              summary: "FastAPI 无法抓取指标"
+              description: "{{ $labels.pod }} 上的 /metrics 不可达，检查 Pod 是否 CrashLoopBackOff。"
+
+          - alert: WorkerNotReady
+            expr: kube_deployment_status_replicas_available{deployment="backtest-worker"} < 1
+            for: 5m
+            labels:
+              severity: critical
+              component: worker
+            annotations:
+              summary: "没有可用的回测 worker"
+              description: "backtest-worker 可用副本为 0，任务不会被执行。"
+
+          - alert: PodRestartLoop
+            expr: increase(kube_pod_container_status_restarts_total{namespace=~"quant-.*"}[30m]) > 3
+            for: 5m
+            labels:
+              severity: warning
+              component: platform
+            annotations:
+              summary: "Pod {{ $labels.pod }} 反复重启"
+              description: "30 分钟内重启 {{ $value }} 次，检查探针配置与 OOMKilled。"
+
+          - alert: DiskSpaceLow
+            expr: |
+              node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} 
+                / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 0.15
+            for: 15m
+            labels:
+              severity: warning
+              component: host
+            annotations:
+              summary: "根分区剩余空间不足 15%"
+              description: "回测产物和 Parquet 文件会持续增长，请清理或扩容。"
+
+          - alert: DiskSpaceCritical
+            expr: |
+              node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+                / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} < 0.05
+            for: 5m
+            labels:
+              severity: critical
+              component: host
+            annotations:
+              summary: "根分区剩余空间不足 5%"
+              description: "MongoDB 与 K3s 都可能因磁盘写满而故障，立即处理。"
+
+          - alert: MemoryPressureHigh
+            expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.9
+            for: 10m
+            labels:
+              severity: warning
+              component: host
+            annotations:
+              summary: "主机内存使用率超过 90%"
+              description: "单机同时跑多个回测时容易触发，考虑降低 worker 并发。"
+
+          - alert: RabbitMQQueueBacklog
+            expr: rabbitmq_queue_messages_ready{queue=~"replay|backtest|factor|optimization|maintenance"} > 50
+            for: 10m
+            labels:
+              severity: warning
+              component: mq
+            annotations:
+              summary: "RabbitMQ 队列 {{ $labels.queue }} 积压 {{ $value }}"
+              description: "消费者处理不过来，检查 worker 是否在线。"
+
+          - alert: RabbitMQDown
+            expr: up{job="rabbitmq"} == 0
+            for: 3m
+            labels:
+              severity: critical
+              component: mq
+            annotations:
+              summary: "RabbitMQ 指标不可达"
+              description: "broker 故障时所有异步任务都会停摆。"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: quant-monitor
+  labels:
+    app: prometheus
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: quant-monitor
+  labels:
+    app: prometheus
+    app.kubernetes.io/part-of: quant-replay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.53.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=15d
+            - --web.enable-lifecycle
+            - --web.external-url=http://localhost/prometheus
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+            items:
+              - key: prometheus.yml
+                path: prometheus.yml
+        - name: rules
+          configMap:
+            name: prometheus-config
+            items:
+              - key: alerts.yml
+                path: alerts.yml
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: quant-monitor
+  labels:
+    app: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
