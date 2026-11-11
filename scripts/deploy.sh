@@ -27,11 +27,27 @@ command -v "${KUBECTL}" >/dev/null 2>&1 || die "找不到 kubectl，请先执行
 "${KUBECTL}" cluster-info >/dev/null 2>&1 || die "无法连接集群，检查 KUBECONFIG 或 k3s 服务状态"
 
 # ---------------------------------------------------------------------------
-info "步骤 1/4：应用 K8s 清单（kubectl apply -k）"
+# 步骤 0：准备 hostPath 数据目录
+#
+# 应用容器以 uid 10001 运行；hostPath 卷不会自动套用 fsGroup，所以这里先把目录
+# 建好并交给 10001（Pod 里还有一个 root initContainer 做兜底 chown）。
+DATA_DIR="${QUANT_DATA_DIR:-/var/lib/quant-data}"
+info "步骤 0/5：准备数据目录 ${DATA_DIR}"
+if mkdir -p "${DATA_DIR}/normalized" "${DATA_DIR}/backtests" "${DATA_DIR}/factors" 2>/dev/null; then
+  if ! chown -R 10001:10001 "${DATA_DIR}" 2>/dev/null; then
+    warn "无法 chown ${DATA_DIR}（需要 root），Pod 的 initContainer 会尝试修复；如仍失败请执行："
+    warn "  sudo chown -R 10001:10001 ${DATA_DIR}"
+  fi
+else
+  warn "无法创建 ${DATA_DIR}，请先执行：sudo mkdir -p ${DATA_DIR} && sudo chown -R 10001:10001 ${DATA_DIR}"
+fi
+
+# ---------------------------------------------------------------------------
+info "步骤 1/5：应用 K8s 清单（kubectl apply -k）"
 "${KUBECTL}" apply -k "${REPO_ROOT}/infrastructure/k3s"
 
 # ---------------------------------------------------------------------------
-info "步骤 2/4：生成 Grafana 数据源与仪表盘 ConfigMap"
+info "步骤 2/5：生成 Grafana 数据源与仪表盘 ConfigMap"
 "${KUBECTL}" -n quant-monitor create configmap grafana-datasources \
   --from-file=datasources.yaml="${GRAFANA_DIR}/datasources.yaml" \
   --dry-run=client -o yaml | "${KUBECTL}" apply -f -
@@ -44,7 +60,7 @@ info "重启 Grafana 以加载新的 provisioning 配置"
 "${KUBECTL}" -n quant-monitor rollout restart deployment/grafana >/dev/null
 
 # ---------------------------------------------------------------------------
-info "步骤 3/4：等待工作负载就绪（超时 ${WAIT}s）"
+info "步骤 3/5：等待工作负载就绪（超时 ${WAIT}s）"
 wait_for() {
   local target="$1"
   if ! "${KUBECTL}" -n "${target%%/*}" rollout status "${target##*/}" --timeout="${WAIT}s"; then
@@ -64,7 +80,7 @@ wait_for "quant-monitor/loki"        || FAILED=1
 wait_for "quant-monitor/grafana"     || FAILED=1
 
 # ---------------------------------------------------------------------------
-info "步骤 4/4：部署结果"
+info "步骤 4/5：部署结果"
 "${KUBECTL}" get pods -A -l app.kubernetes.io/part-of=quant-replay -o wide || true
 
 if "${KUBECTL}" -n quant-app get secret quant-secret -o yaml 2>/dev/null | grep -q "REPLACE_ME"; then

@@ -18,6 +18,19 @@ kubectl -n quant-core rollout status deploy/backtest-worker
 
 注意：`imagePullPolicy: IfNotPresent` 时，**同 tag 重新导入不会生效**，必须换 tag。
 
+### 数据目录权限
+
+应用容器以 uid **10001** 运行，而 hostPath 卷不会自动套用 `fsGroup`。首次部署前确保：
+
+```bash
+sudo mkdir -p /var/lib/quant-data/{normalized,backtests,factors}
+sudo chown -R 10001:10001 /var/lib/quant-data
+```
+
+`scripts/deploy.sh` 会自动尝试创建并 chown；三个工作负载（api / web / backtest-worker）
+另外各带一个 root `initContainer`（busybox）做兜底 chown。如果日志里出现
+`Permission denied: '/data/backtests/run_id=...'`，说明这一步没生效。
+
 回滚：
 
 ```bash

@@ -87,13 +87,34 @@ def _expand_grid(grid: dict[str, Sequence[Any]]) -> list[dict[str, Any]]:
     return [dict(zip(keys, combo, strict=False)) for combo in itertools.product(*values)]
 
 
+def _writable_root(path: str | None, fallback: str) -> str:
+    """Use the incoming root only when this worker can actually write there.
+
+    The API and the worker may run in different mount namespaces (a host path in
+    the payload does not necessarily exist inside the worker container). When the
+    payload path is unusable we fall back to this worker's own configured root,
+    which is the one shared with the API in a real deployment.
+    """
+    candidate = path or fallback
+    try:
+        Path(candidate).mkdir(parents=True, exist_ok=True)
+        probe = Path(candidate) / ".write_probe"
+        probe.touch()
+        probe.unlink()
+        return candidate
+    except OSError:
+        logger.warning("root %s not usable in this worker, falling back to %s", candidate, fallback)
+        Path(fallback).mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 def _prepare_payload(config: dict[str, Any], run_id: str) -> dict[str, Any]:
-    """Fill the roots from the environment (QR_DATA_ROOT / QR_OUTPUT_ROOT)."""
+    """Resolve the data / output roots inside the worker's own namespace."""
     payload = dict(config)
-    if not payload.get("data_root"):
-        payload["data_root"] = os.getenv("QR_DATA_ROOT") or DEFAULT_DATA_ROOT
-    if not payload.get("output_root"):
-        payload["output_root"] = os.getenv("QR_OUTPUT_ROOT") or DEFAULT_OUTPUT_ROOT
+    data_root = _writable_root(payload.get("data_root"), os.getenv("QR_DATA_ROOT") or DEFAULT_DATA_ROOT)
+    output_root = _writable_root(payload.get("output_root"), os.getenv("QR_OUTPUT_ROOT") or DEFAULT_OUTPUT_ROOT)
+    payload["data_root"] = data_root
+    payload["output_root"] = output_root
     payload["run_id"] = run_id
     return payload
 

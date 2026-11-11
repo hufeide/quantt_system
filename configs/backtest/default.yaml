@@ -3,7 +3,7 @@ strategy: sma_cross
 strategy_params:
   fast: 5
   slow: 20
-  weight: 0.9
+  weight: 0.25   # 单标的 25% 仓位；配合 risk.max_position_weight=0.30 可通过风控
 symbols:
   - "600000.SH"
   - "000001.SZ"
@@ -31,7 +31,7 @@ matching:
   t_plus_1: true
 risk:
   max_position_weight: 0.30
-  max_order_value: 200000
+  max_order_value: 400000
   max_total_exposure: 1.0
   max_drawdown: 0.25
   min_cash_reserve: 0
